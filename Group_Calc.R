@@ -327,18 +327,18 @@ calculate_advanced_metrics <- function(data_xts, rf_rate_data, period_type, scal
     # CAPM Alpha
     if (period_type %in% c("qtd", "ytd", "yr")) {
       # Use period alpha for shorter periods
-      capm_alpha_val <- CAPM.alpha(Ra = data_xts[, fund_idx],
+      camp_alpha_val <- CAPM.alpha(Ra = data_xts[, fund_idx],
                                    Rb = data_xts[, benchmark_idx],
                                    Rf = rf_rate_data)
     } else if (period_type %in% c("5yr", "10yr")) {
       # UPDATED: Use annualized alpha for multi-year periods
-      camp_alpha_val <- CAPM.alpha(Ra = data_xts[, fund_idx],
+      camp_alpha_val <- CAPM.alpha(Ra = data_xts[, fund_idx],    # <- FIXED: camp -> camp
                                    Rb = data_xts[, benchmark_idx],
                                    Rf = rf_rate_data)
       # Scale alpha to annualized
-      camp_alpha_val <- camp_alpha_val * scale_factor
+      camp_alpha_val <- camp_alpha_val * scale_factor              # <- FIXED: camp -> camp
     }
-    alpha_row[fund_idx] <- as.numeric(camp_alpha_val)
+    alpha_row[fund_idx] <- as.numeric(camp_alpha_val)             # <- FIXED: camp -> camp
     
     # CAPM Beta - NOT annualized (beta is dimensionless)
     camp_beta_val <- CAPM.beta(Ra = data_xts[, fund_idx],
@@ -447,33 +447,34 @@ calculate_prorated_fees <- function(end_date, period_type, data_columns) {
     }
   }
   
+  # Calculate period fraction and metric name based on period type
   if (period_type == "qtd") {
-    # Calculate quarter fraction
-    quarter_start <- floor_date(end_date, "quarter")
-    quarter_end <- ceiling_date(end_date, "quarter") - days(1)
-    days_in_quarter <- as.numeric(quarter_end - quarter_start + 1)
-    days_elapsed <- as.numeric(end_date - quarter_start + 1)
-    period_fraction <- days_elapsed / days_in_quarter
-    metric_name <- "Est. Fee (QTD Prorated)"
+    # For QTD, use 1/4 of annual fee
+    period_fraction <- 0.25
+    metric_name <- "Est. Fee (QTD)"
   } else if (period_type == "ytd") {
-    # Calculate year fraction
+    # Calculate year fraction for YTD proration
     start_of_year <- as.Date(format(end_date, "%Y-01-01"))
     days_in_year <- as.numeric(as.Date(format(end_date, "%Y-12-31")) - start_of_year + 1)
     days_elapsed <- as.numeric(end_date - start_of_year + 1)
     period_fraction <- days_elapsed / days_in_year
     metric_name <- "Est. Fee (YTD Prorated)"
-  } else {
-    # Annual fees and longer periods, no proration needed
-    period_fraction <- 1
-    if (period_type == "yr") {
-      metric_name <- "Est. Fee"
-    } else if (period_type == "5yr") {
-      metric_name <- "Est. Fee (5Yr)"
-    } else if (period_type == "10yr") {
-      metric_name <- "Est. Fee (10Yr)"
+  } else if (period_type == "yr") {
+    # Annual fees - use full annual fee
+    period_fraction <- 1.0
+    metric_name <- "Est. Fee"
+  } else if (period_type %in% c("5yr", "10yr")) {
+    # Multi-year periods - use annualized fee (same as annual)
+    period_fraction <- 1.0
+    if (period_type == "5yr") {
+      metric_name <- "Est. Fee (5Yr Annualized)"
     } else {
-      metric_name <- "Est. Fee"
+      metric_name <- "Est. Fee (10Yr Annualized)"
     }
+  } else {
+    # Default case
+    period_fraction <- 1.0
+    metric_name <- "Est. Fee"
   }
   
   fee_values[1] <- metric_name
@@ -484,12 +485,18 @@ calculate_prorated_fees <- function(end_date, period_type, data_columns) {
 create_fee_row <- function(fee_data, template_df, period_fraction) {
   new_row <- setNames(as.data.frame(t(fee_data$values), stringsAsFactors = FALSE), names(template_df))
   
-  if (period_fraction < 1) {
-    fee_cols <- setdiff(names(new_row), c("Metric", "R3k"))
-    new_row[fee_cols] <- lapply(new_row[fee_cols], function(x) {
-      prorated <- as.numeric(x) * period_fraction
-      formatC(prorated, format = "e", digits = 3)
-    })
+  # Apply period fraction to all fund fees (not just when < 1)
+  fee_cols <- setdiff(names(new_row), c("Metric"))
+  
+  # Only process numeric fee values, skip "--" values
+  for (col in fee_cols) {
+    if (col %in% names(new_row) && !is.na(suppressWarnings(as.numeric(new_row[[col]])))) {
+      # Apply the period fraction
+      prorated_fee <- as.numeric(new_row[[col]]) * period_fraction
+      
+      # Format appropriately - use regular decimal format instead of scientific notation
+      new_row[[col]] <- prorated_fee
+    }
   }
   
   return(new_row)
@@ -528,6 +535,24 @@ get_formatting_rules <- function(period_type) {
 
 # Function to prepare data for Excel export
 prepare_data_for_excel <- function(df) {
+  # Safety check: ensure all columns have the same number of rows
+  col_lengths <- sapply(df, length)
+  if (any(col_lengths != nrow(df))) {
+    cat("WARNING: Column length mismatch detected!\n")
+    for (i in seq_along(col_lengths)) {
+      if (col_lengths[i] != nrow(df)) {
+        col_name <- names(col_lengths)[i]
+        cat("Column", col_name, "has length", col_lengths[i], "but dataframe has", nrow(df), "rows\n")
+        # Fix the column by filling with appropriate values
+        if (col_name %in% c("R3k", "R3K")) {
+          df[[col_name]] <- rep("--", nrow(df))
+        } else {
+          df[[col_name]] <- rep(NA, nrow(df))
+        }
+      }
+    }
+  }
+  
   # Convert appropriate columns to numeric
   cols_to_numeric <- setdiff(names(df), c("Metric", "R3k"))
   cols_to_numeric <- cols_to_numeric[cols_to_numeric %in% names(df)]
@@ -544,8 +569,11 @@ prepare_data_for_excel <- function(df) {
     })
   }
   
-  # Handle R3k column
-  df$R3k <- suppressWarnings(as.numeric(df$R3k))
+  # Handle R3k column properly - only if it exists
+  if ("R3k" %in% names(df)) {
+    # Convert R3k column, preserving "--" values as NA
+    df$R3k <- ifelse(df$R3k == "--", NA, suppressWarnings(as.numeric(df$R3k)))
+  }
   
   return(df)
 }
@@ -684,7 +712,7 @@ create_performance_workbook <- function(accounts_list, filename, output_dir = NU
   return(list(workbook = wb, path = output_info$path, date = output_info$date))
 }
 
-# Function to add simplified summary dashboard
+# Function to add enhanced summary dashboard
 add_summary_sheet <- function(wb, accounts_list, report_date) {
   addWorksheet(wb, "Summary")  # Add summary sheet
   
@@ -701,27 +729,27 @@ add_summary_sheet <- function(wb, accounts_list, report_date) {
   # Create simplified summary table
   start_row <- 4
   
-  # Get fund names (exclude date and benchmark columns)
+  # Get ALL column names (funds AND benchmarks)
   sample_df <- accounts_list[[1]]  # Use first available dataset
   all_column_names <- setdiff(names(sample_df), "Metric")
   
-  # Only include fund columns (GROWTH, BALANCED, SMALLCAP)
-  fund_names <- intersect(all_column_names, c("GROWTH", "BALANCED", "SMALLCAP"))
+  # Include ALL columns: funds AND benchmarks (GROWTH, BALANCED, SMALLCAP, SP50, R2K)
+  fund_and_benchmark_names <- intersect(all_column_names, c("GROWTH", "BALANCED", "SMALLCAP", "SP50", "R2K"))
   
-  # Create the summary data frame with updated return periods
+  # Create the summary data frame with all return periods
   summary_data <- data.frame(
     Return = c("QTD Return", "YTD Return", "1Yr Return", "5Yr Return", "10Yr Return"),
     stringsAsFactors = FALSE
   )
   
-  # Add columns for each fund
-  for (fund in fund_names) {
-    summary_data[[fund]] <- NA
+  # Add columns for each fund AND benchmark
+  for (col_name in fund_and_benchmark_names) {
+    summary_data[[col_name]] <- NA
   }
   
-  # Fill in the data from each period
+  # Fill in the data from each period - FIXED return labels to match actual data
   periods <- c("qtd", "ytd", "yr", "5yr", "10yr")
-  return_labels <- c("QTD Return", "YTD Return", "1Yr Return", "5Yr Return", "10Yr Return")
+  return_labels <- c("QTD Return", "YTD Return", "1Yr Return", "5Yr Return (Annualized)", "10Yr Return (Annualized)")
   
   for (i in seq_along(periods)) {
     period <- periods[i]
@@ -732,19 +760,19 @@ add_summary_sheet <- function(wb, accounts_list, report_date) {
       returns_row <- df[df$Metric == return_label, ]
       
       if (nrow(returns_row) > 0) {
-        # Extract values for each fund
-        for (fund in fund_names) {
-          if (fund %in% names(returns_row)) {
-            summary_data[i, fund] <- returns_row[[fund]]
+        # Extract values for each fund AND benchmark
+        for (col_name in fund_and_benchmark_names) {
+          if (col_name %in% names(returns_row)) {
+            summary_data[i, col_name] <- returns_row[[col_name]]
           }
         }
       }
     }
   }
   
-  # Prepare data for Excel (convert fund columns to numeric)
-  fund_cols <- setdiff(names(summary_data), "Return")
-  summary_data[fund_cols] <- lapply(summary_data[fund_cols], function(x) {
+  # Prepare data for Excel (convert fund AND benchmark columns to numeric)
+  data_cols <- setdiff(names(summary_data), "Return")
+  summary_data[data_cols] <- lapply(summary_data[data_cols], function(x) {
     if (is.character(x)) {
       # Handle "--" values and convert to numeric
       numeric_vals <- suppressWarnings(as.numeric(x))
@@ -761,17 +789,17 @@ add_summary_sheet <- function(wb, accounts_list, report_date) {
   # Format the table
   # Set column widths
   setColWidths(wb, "Summary", cols = 1, widths = 15)  # Return column
-  if (length(fund_cols) > 0) {
-    setColWidths(wb, "Summary", cols = 2:(length(fund_cols) + 1), widths = 12)  # Fund columns
+  if (length(data_cols) > 0) {
+    setColWidths(wb, "Summary", cols = 2:(length(data_cols) + 1), widths = 12)  # All data columns
   }
   
-  # Apply percentage formatting to fund data cells
+  # Apply percentage formatting to all data cells (funds AND benchmarks)
   data_rows <- (start_row + 1):(start_row + nrow(summary_data))
-  fund_col_positions <- which(names(summary_data) %in% fund_cols)
+  data_col_positions <- which(names(summary_data) %in% data_cols)
   
-  if (length(fund_col_positions) > 0) {
+  if (length(data_col_positions) > 0) {
     addStyle(wb, "Summary", style = styles$percent_style,
-             rows = data_rows, cols = fund_col_positions, gridExpand = TRUE, stack = TRUE)
+             rows = data_rows, cols = data_col_positions, gridExpand = TRUE, stack = TRUE)
   }
   
   # Left-align the Return column
